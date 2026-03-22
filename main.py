@@ -422,22 +422,44 @@ class ImprovedDriverDetector:
         return False
     
     def draw_facial_features(self, frame, facial_metrics):
-        """Draw eye and mouth contours"""
+        """Draw landmarks in Tech/Sci-fi style (Dots + Thin Lines)"""
         if not facial_metrics:
             return
 
-        # Chi doi do khi mat nham lien tuc > 3 frames (tranh nhap nhay do nhay mat)
-        eye_color = (0, 0, 255) if self.drowsy_frames > 3 else (0, 255, 0)
-        cv2.polylines(frame, [facial_metrics['left_eye'].astype(np.int32)],
-                     True, eye_color, 2)
-        cv2.polylines(frame, [facial_metrics['right_eye'].astype(np.int32)],
-                     True, eye_color, 2)
+        # Colors (BGR)
+        # Cyan for normal state (rat noi tren nen toi/camera)
+        color_normal = (255, 255, 0)   
+        color_alert  = (0, 0, 255)     # Red
+        color_warn   = (0, 140, 255)   # Orange
 
-        # Ve duong thang noi 4 diem mieng thay vi polylines
-        mouth = facial_metrics['mouth'].astype(np.int32)
-        mouth_color = (0, 165, 255) if facial_metrics['is_yawning'] else (0, 255, 255)
-        cv2.line(frame, tuple(mouth[0]), tuple(mouth[1]), mouth_color, 2)  # ngang
-        cv2.line(frame, tuple(mouth[2]), tuple(mouth[3]), mouth_color, 2)  # doc
+        # Determine colors based on state
+        eye_color = color_alert if self.drowsy_frames > 3 else color_normal
+        mouth_color = color_warn if facial_metrics['is_yawning'] else color_normal
+
+        # --- DRAW EYES ---
+        # Line thickness: 1 (elegant), Dot radius: 2
+        for eye_name in ['left_eye', 'right_eye']:
+            pts = facial_metrics[eye_name].astype(np.int32)
+            
+            # 1. Draw smooth contour
+            cv2.polylines(frame, [pts], True, eye_color, 1, cv2.LINE_AA)
+            
+            # 2. Draw dots at keypoints (Tech look)
+            for pt in pts:
+                cv2.circle(frame, tuple(pt), 2, eye_color, -1, cv2.LINE_AA)
+
+        # --- DRAW MOUTH ---
+        # Re-order points to form a diamond shape: Left->Top->Right->Bottom
+        corners = facial_metrics['mouth'].astype(np.int32)
+        # indices from extract: 0:Left, 1:Right, 2:Top, 3:Bottom
+        mouth_poly = np.array([corners[0], corners[2], corners[1], corners[3]])
+        
+        # 1. Draw contour
+        cv2.polylines(frame, [mouth_poly], True, mouth_color, 1, cv2.LINE_AA)
+        
+        # 2. Draw dots
+        for pt in mouth_poly:
+            cv2.circle(frame, tuple(pt), 2, mouth_color, -1, cv2.LINE_AA)
     
     def draw_ui(self, frame, faces, predictions_data, facial_metrics=None):
         """Draw enhanced UI"""
