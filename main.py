@@ -16,6 +16,16 @@ from collections import deque
 import os
 import mediapipe as mp
 
+try:
+    import simpleaudio as sa
+except ImportError:
+    sa = None
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 # Disable GPU to force CPU usage (remove if you have GPU)
 # tf.config.set_visible_devices([], 'GPU')
 
@@ -92,10 +102,45 @@ class ImprovedDriverDetector:
         # Alert system
         self.last_alert_time = 0
         self.alert_cooldown = 2.0
+        self.sound_enabled = True
+        self.alert_wave = None
+
+        if sa is not None:
+            # Pre-generate short warning tone to avoid runtime latency.
+            sample_rate = 44100
+            duration = 0.35
+            frequency = 880
+            t = np.linspace(0, duration, int(sample_rate * duration), False)
+            tone = 0.5 * np.sin(2 * np.pi * frequency * t)
+            self.alert_wave = (tone * 32767).astype(np.int16)
         
         print("🚀 Initializing Improved Driver Drowsiness Detection System...")
         self._load_model()
         self._load_detectors()
+
+    def play_alert_sound(self):
+        """Play a short non-blocking alert sound."""
+        if not self.sound_enabled:
+            return
+
+        if sa is not None and self.alert_wave is not None:
+            sa.play_buffer(self.alert_wave, 1, 2, 44100)
+            return
+
+        if winsound:
+            # Play system warning sound asynchronously on Windows.
+            winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+            return
+
+        # Fallback for environments without winsound support.
+        print("\a", end="", flush=True)
+
+    def trigger_alert(self, predicted_class, facial_metrics=None):
+        """Trigger alert sound if alert condition is met."""
+        if self.should_alert(predicted_class, facial_metrics):
+            self.play_alert_sound()
+            return True
+        return False
         
     def _load_model(self):
         """Load the trained model"""
@@ -413,9 +458,9 @@ class ImprovedDriverDetector:
             if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD:
                 self.last_alert_time = current_time
                 return True
-        
-        # Check model prediction
-        if alert_config[predicted_class]['sound']:
+
+        # Only alert for drowsy class from model output
+        if predicted_class == 4:
             self.last_alert_time = current_time
             return True
         
@@ -638,7 +683,7 @@ class ImprovedDriverDetector:
                     predictions_data.append((predicted_class, confidence, smoothed_predictions))
                     
                     # Check for alerts
-                    if self.should_alert(predicted_class, facial_metrics):
+                    if self.trigger_alert(predicted_class, facial_metrics):
                         print(f"🚨 ALERT: {class_names[predicted_class]} detected!")
                         if facial_metrics and facial_metrics['is_drowsy']:
                             print(f"   Eyes closed for {self.drowsy_frames} frames!")

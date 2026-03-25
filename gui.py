@@ -264,6 +264,9 @@ class ModernDrowsinessApp:
                 
                 # 4. UPDATE UI COMPONENTS
                 self.update_status_display(prediction_result, facial_metrics)
+
+                if self.detector.trigger_alert(prediction_result, facial_metrics):
+                    print(f"🚨 ALERT: {driver_detection.class_names[prediction_result]} detected!")
                 
                 # Update Metrics
                 if facial_metrics:
