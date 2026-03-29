@@ -4,4 +4,3 @@ opencv_contrib_python==4.11.0.86
 opencv_python==4.11.0.86
 Pillow==12.1.1
 tensorflow==2.21.0
-
