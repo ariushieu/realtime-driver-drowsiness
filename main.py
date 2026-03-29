@@ -19,7 +19,7 @@ import mediapipe as mp
 # Disable GPU to force CPU usage (remove if you have GPU)
 # tf.config.set_visible_devices([], 'GPU')
 
-# Class names - tieng Viet (khong dau vi OpenCV chi ho tro ASCII)
+# Class names 
 class_names = {
     0: 'Lai xe nguy hiem',
     1: 'Mat tap trung',
