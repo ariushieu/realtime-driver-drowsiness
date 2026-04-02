@@ -19,7 +19,7 @@ import mediapipe as mp
 # Disable GPU to force CPU usage (remove if you have GPU)
 # tf.config.set_visible_devices([], 'GPU')
 
-# Class names - tieng Viet (khong dau vi OpenCV chi ho tro ASCII)
+# Class names 
 class_names = {
     0: 'Lai xe nguy hiem',
     1: 'Mat tap trung',
@@ -40,16 +40,27 @@ alert_config = {
 }
 
 class ImprovedDriverDetector:
-    def __init__(self, model_path="B0_16_batches.weights.keras", 
+    def __init__(self, model_path=None,
                  use_mediapipe=True, use_facemesh=True):
         """
         Initialize improved detector
-        
+
         Args:
-            model_path: Path to trained model weights
+            model_path: Path to trained model weights (auto-detect if None)
             use_mediapipe: Use MediaPipe for face detection (vs Haar Cascades)
             use_facemesh: Use FaceMesh for landmark detection (eyes, mouth tracking)
         """
+        # Auto-detect model weights: prefer B1, fallback to B0
+        if model_path is None:
+            if os.path.exists("B1_16_batches.weights.keras"):
+                model_path = "B1_16_batches.weights.keras"
+            elif os.path.exists("B0_16_batches.weights.keras"):
+                model_path = "B0_16_batches.weights.keras"
+            else:
+                raise FileNotFoundError(
+                    "No model weights found. Expected B1_16_batches.weights.keras "
+                    "or B0_16_batches.weights.keras"
+                )
         self.model_path = model_path
         self.model = None
         self.use_mediapipe = use_mediapipe
@@ -67,7 +78,7 @@ class ImprovedDriverDetector:
         # Performance tracking
         self.fps_counter = deque(maxlen=30)
         self.inference_times = deque(maxlen=10)
-        self.prediction_history = deque(maxlen=10)
+        self.prediction_history = deque(maxlen=5)
         
         # Drowsiness metrics
         self.ear_history = deque(maxlen=20)  # Eye Aspect Ratio history
@@ -82,7 +93,10 @@ class ImprovedDriverDetector:
         self.EAR_BASELINE = None          # EAR trung binh khi mat mo (calibrated)
         self.MAR_THRESHOLD = 0.35
         self.DROWSY_FRAMES_THRESHOLD = 20
-        self.CONFIDENCE_THRESHOLD = 0.40  # Ha xuong 0.40 de nhan dang cac class khac
+        
+        # IMPROVED: Temporal smoothing cho predictions
+        self.class_vote_history = deque(maxlen=5)  # Luu 5 predictions gan nhat
+        self.last_stable_class = 3  # Mac dinh Safe
 
         # Calibration
         self.CALIBRATION_FRAMES = 60      # So frame de do baseline EAR
@@ -98,19 +112,29 @@ class ImprovedDriverDetector:
         self._load_detectors()
         
     def _load_model(self):
-        """Load the trained model"""
-        print("🔄 Loading EfficientNet-B0 model...")
-        
-        base_model = tf.keras.applications.EfficientNetB0(
+        """Load the trained model with correct architecture matching weights"""
+        # Auto-detect variant from filename
+        if "B1" in os.path.basename(self.model_path).upper():
+            variant = "B1"
+            efficientnet_cls = tf.keras.applications.EfficientNetB1
+        else:
+            variant = "B0"
+            efficientnet_cls = tf.keras.applications.EfficientNetB0
+
+        # Training used 224x224 for ALL variants (see notebook cell-18)
+        input_size = 224
+        print(f"🔄 Loading EfficientNet-{variant} model ({input_size}x{input_size})...")
+
+        base_model = efficientnet_cls(
             weights=None,
             include_top=False,
-            input_shape=(224, 224, 3)
+            input_shape=(input_size, input_size, 3),
         )
-        # Pre-build base_model to create all internal layer variables
-        # (e.g. EfficientNet's Normalization layer mean/variance/count)
-        base_model(tf.zeros((1, 224, 224, 3)))
+        # DO NOT pre-build with tf.zeros() — it creates variable names that
+        # differ from the training checkpoint, causing skip_mismatch to silently
+        # drop the Normalization layer weights (mean/variance).
         base_model.trainable = True
-        
+
         self.model = tf.keras.models.Sequential([
             base_model,
             tf.keras.layers.GlobalAveragePooling2D(),
@@ -122,14 +146,24 @@ class ImprovedDriverDetector:
             tf.keras.layers.Dropout(0.3),
             tf.keras.layers.Dense(6, activation='softmax')
         ])
-        self.model(tf.zeros((1, 224, 224, 3)))
-        
+        # DO NOT pre-build the Sequential model either.
+
         if os.path.exists(self.model_path):
-            # skip_mismatch=True handles Normalization layer variable name differences
-            # between the Keras version used during training and the current version.
-            # The Normalization preprocessing layer stats are non-critical for inference.
-            self.model.load_weights(self.model_path, skip_mismatch=True)
-            print("✅ Model weights loaded successfully!")
+            # Load WITHOUT skip_mismatch so all weights (including
+            # Normalization stats) are loaded correctly.
+            self.model.load_weights(self.model_path)
+            print(f"✅ Model weights loaded from {self.model_path}")
+
+            # Validate: check Normalization layer inside the base model
+            base_layer = self.model.layers[0]  # EfficientNet base
+            first_weights = base_layer.get_weights()
+            if first_weights:
+                w = first_weights[0]
+                if np.max(np.abs(w)) == 0:
+                    print("⚠️  WARNING: Base model Normalization weights are all zero!")
+                    print("    Model may not work correctly. Check weight file compatibility.")
+                else:
+                    print(f"✅ Normalization weights OK (mean abs={np.mean(np.abs(w)):.4f})")
         else:
             raise FileNotFoundError(f"❌ Model file not found: {self.model_path}")
     
@@ -344,60 +378,104 @@ class ImprovedDriverDetector:
         return None
     
     def preprocess_face(self, face_img):
-        """Preprocess face image - exact match with training pipeline"""
-        face_resized = cv2.resize(face_img, (224, 224))
-        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
-        
-        # Convert to grayscale and duplicate to 3 channels (matching training)
-        face_gray = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY)
-        face_3channel = np.stack([face_gray, face_gray, face_gray], axis=-1)
-        
-        face_normalized = face_3channel.astype(np.float32) / 255.0
-        face_batch = np.expand_dims(face_normalized, axis=0)
-        
-        return face_batch
+        """Preprocess face image - exact match with training pipeline.
+
+        Training order (notebook cell-11):
+            1. decode JPEG → RGB (uint8)
+            2. crop bounding box
+            3. rgb_to_grayscale  →  concat ×3          ← grayscale FIRST
+            4. tf.image.resize((224, 224))              ← resize SECOND
+            5. float32 / 255.0
+
+        We replicate this with TensorFlow ops so the numerical result
+        is identical (same grayscale coefficients, same bilinear kernel).
+        """
+        # face_img is BGR uint8 from OpenCV
+        face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
+        # Use TF ops to match training exactly
+        img_tensor = tf.constant(face_rgb, dtype=tf.uint8)
+
+        # 1. Grayscale BEFORE resize (matches training order)
+        gray = tf.image.rgb_to_grayscale(img_tensor)          # (H, W, 1)
+        gray_3ch = tf.concat([gray, gray, gray], axis=-1)     # (H, W, 3)
+
+        # 2. Resize with TF bilinear (same as tf.image.resize in training)
+        resized = tf.image.resize(gray_3ch, (224, 224))        # float32
+
+        # 3. Normalize to [0, 1]
+        normalized = resized / 255.0
+
+        face_batch = tf.expand_dims(normalized, axis=0)        # (1, 224, 224, 3)
+        return face_batch.numpy()
     
     def fuse_prediction(self, predicted_class, confidence, facial_metrics):
         """
         Ket hop ket qua model CNN voi chi so EAR/MAR.
-        Nguyen tac: EAR/MAR chi dung de xac nhan hoac bac bo class buon ngu/ngap.
-        Cac class khac (mat tap trung, uong nuoc, nguy hiem) de model tu quyet dinh.
+
+        Nguyen tac:
+        - Model CNN la nguon chinh; EAR/MAR chi *ho tro* dieu chinh 2 class
+          lien quan truc tiep (SleepyDriving va Yawn).
+        - Cac class khac (DangerousDriving, Distracted, Drinking, Safe)
+          hoan toan do model quyet dinh.
+        - Khong ep ve SafeDriving khi confidence thap – de model tu quyet dinh;
+          smooth_predictions da lam nhiem vu on dinh.
         """
-        # 1. Model khong du tin cay -> mac dinh an toan
-        if confidence < self.CONFIDENCE_THRESHOLD:
-            return 3, confidence  # SafeDriving
+        if facial_metrics is None:
+            return predicted_class, confidence
 
-        if facial_metrics:
-            ear_drowsy = facial_metrics['is_drowsy']
-            mar_yawning = facial_metrics['is_yawning']
+        ear_drowsy = facial_metrics['is_drowsy']
+        mar_yawning = facial_metrics['is_yawning']
 
-            # 2. Model bao buon ngu (4) nhung EAR khong xac nhan -> ha cap
-            if predicted_class == 4 and not ear_drowsy:
+        # BOOST: EAR/MAR xac nhan -> tang confidence
+        if predicted_class == 4 and ear_drowsy:
+            confidence = min(confidence * 1.3, 1.0)
+        if predicted_class == 5 and mar_yawning:
+            confidence = min(confidence * 1.3, 1.0)
+
+        # 1. Model bao buon ngu (4) nhung mat van mo binh thuong -> ha cap
+        if predicted_class == 4 and not ear_drowsy:
+            # Chi ha cap neu confidence thap; confidence cao thi tin model
+            if confidence < 0.60:
                 return 3, confidence  # SafeDriving
 
-            # 3. Model bao ngap (5) nhung MAR khong xac nhan -> ha cap
-            if predicted_class == 5 and not mar_yawning:
+        # 2. Model bao ngap (5) nhung mieng dong -> ha cap
+        if predicted_class == 5 and not mar_yawning:
+            if confidence < 0.60:
                 return 3, confidence  # SafeDriving
 
-            # 4. EAR thap lien tuc (> 5 frames) nhung model bao an toan/mat tap trung
-            #    -> nang cap len buon ngu
-            if self.drowsy_frames > 5 and predicted_class in (1, 3):
-                return 4, confidence  # SleepyDriving
+        # 3. EAR thap lien tuc (nhieu frame) nhung model khong nhan ra
+        #    -> nang cap len buon ngu
+        if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD // 2 and predicted_class == 3:
+            return 4, confidence  # SleepyDriving
 
-        # Cac class con lai (0-DangerousDriving, 1-Distracted, 2-Drinking, 3-Safe)
-        # giu nguyen ket qua model neu confidence du cao
+        # 4. MAR cao (dang ngap) nhung model khong nhan ra
+        if mar_yawning and predicted_class == 3:
+            return 5, confidence  # Yawn
+
         return predicted_class, confidence
 
     def smooth_predictions(self, prediction):
-        """Smooth predictions over time"""
+        """Smooth predictions using exponentially-weighted moving average.
+
+        Recent frames get higher weight so the display reacts quickly
+        while still filtering single-frame noise.
+        alpha = 0.6 means current frame contributes 60 %, history 40 %.
+        """
         self.prediction_history.append(prediction)
-        
-        if len(self.prediction_history) < 3:
+
+        if len(self.prediction_history) < 2:
             return prediction
-        
-        recent_predictions = np.array(list(self.prediction_history))
-        smoothed = np.mean(recent_predictions, axis=0)
-        
+
+        alpha = 0.6  # weight for the most recent frame
+        recent = np.array(list(self.prediction_history))
+
+        # Build exponential weights: oldest → newest
+        n = len(recent)
+        weights = np.array([(1 - alpha) ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+
+        smoothed = np.average(recent, axis=0, weights=weights)
         return smoothed
     
     def should_alert(self, predicted_class, facial_metrics=None):
