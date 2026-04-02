@@ -103,6 +103,13 @@ class ImprovedDriverDetector:
         self.calibration_ear_buffer = []  # Buffer luu EAR trong pha calibration
         self.is_calibrated = False
         
+        # Stability filter: class phai thang lien tuc N frame moi duoc hien thi
+        self.stable_class = 3          # class dang hien thi (mac dinh Safe)
+        self.stable_confidence = 0.0
+        self.candidate_class = 3       # class dang "cho" du frame
+        self.candidate_count = 0       # so frame lien tuc cua candidate
+        self.STABILITY_FRAMES = 3      # can 3 frame lien tuc moi chuyen class
+
         # Alert system
         self.last_alert_time = 0
         self.alert_cooldown = 2.0
@@ -477,6 +484,28 @@ class ImprovedDriverDetector:
 
         smoothed = np.average(recent, axis=0, weights=weights)
         return smoothed
+
+    def stabilize_class(self, predicted_class, confidence):
+        """Yeu cau class phai thang lien tuc STABILITY_FRAMES frame moi chuyen.
+
+        Tranh nhay lung tung giua cac class khi model dao dong.
+        Class nguy hiem (0-DangerousDriving, 4-SleepyDriving) duoc chuyen
+        nhanh hon (chi can 2 frame) de dam bao canh bao kip thoi.
+        """
+        # Class nguy hiem can it frame hon de phan ung nhanh
+        required = 2 if predicted_class in (0, 4) else self.STABILITY_FRAMES
+
+        if predicted_class == self.candidate_class:
+            self.candidate_count += 1
+        else:
+            self.candidate_class = predicted_class
+            self.candidate_count = 1
+
+        if self.candidate_count >= required:
+            self.stable_class = self.candidate_class
+            self.stable_confidence = confidence
+
+        return self.stable_class, self.stable_confidence
     
     def should_alert(self, predicted_class, facial_metrics=None):
         """Determine if alert should be triggered"""
@@ -712,6 +741,11 @@ class ImprovedDriverDetector:
                     predicted_class, confidence = self.fuse_prediction(
                         predicted_class, confidence, facial_metrics
                     )
+
+                    # Stability filter: class phai on dinh nhieu frame moi chuyen
+                    predicted_class, confidence = self.stabilize_class(
+                        predicted_class, confidence
+                    )
                     
                     predictions_data.append((predicted_class, confidence, smoothed_predictions))
                     
@@ -739,6 +773,11 @@ class ImprovedDriverDetector:
                     self.blink_counter = 0
                     self.yawn_counter = 0
                     self.drowsy_frames = 0
+                    self.stable_class = 3
+                    self.stable_confidence = 0.0
+                    self.candidate_class = 3
+                    self.candidate_count = 0
+                    self.prediction_history.clear()
                     print("🔄 Counters reset")
                 
                 frame_count += 1
