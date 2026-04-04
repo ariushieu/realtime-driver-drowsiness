@@ -78,7 +78,7 @@ class ImprovedDriverDetector:
         # Performance tracking
         self.fps_counter = deque(maxlen=30)
         self.inference_times = deque(maxlen=10)
-        self.prediction_history = deque(maxlen=5)
+        self.prediction_history = deque(maxlen=8)  # tang buffer de smooth tot hon
         
         # Drowsiness metrics
         self.ear_history = deque(maxlen=20)  # Eye Aspect Ratio history
@@ -108,7 +108,25 @@ class ImprovedDriverDetector:
         self.stable_confidence = 0.0
         self.candidate_class = 3       # class dang "cho" du frame
         self.candidate_count = 0       # so frame lien tuc cua candidate
-        self.STABILITY_FRAMES = 3      # can 3 frame lien tuc moi chuyen class
+        self.STABILITY_FRAMES = 4      # can 4 frame lien tuc moi chuyen class (non-critical)
+
+        # Hysteresis: can nhieu frame hon de ROI KHOI trang thai nguy hiem,
+        # it frame hon de VAO trang thai nguy hiem
+        self.STABILITY_ENTER = {       # frame can de CHUYEN VAO class nay
+            0: 2,  # DangerousDriving  -> vao nhanh
+            1: 6,  # Distracted        -> can 6 frame lien tuc moi bao mat tap trung
+            2: 4,  # Drinking          -> can 4 frame
+            3: 3,  # Safe              -> ve safe cung can 3 frame (tranh nhay)
+            4: 2,  # SleepyDriving     -> vao nhanh
+            5: 3,  # Yawn              -> 3 frame
+        }
+        self.STABILITY_EXIT = {        # frame can de ROI KHOI class nay ve Safe
+            0: 5,  # DangerousDriving  -> roi cham (an toan)
+            1: 3,  # Distracted        -> roi de hon vao
+            2: 3,  # Drinking
+            4: 5,  # SleepyDriving     -> roi cham
+            5: 4,  # Yawn
+        }
 
         # Alert system
         self.last_alert_time = 0
@@ -273,7 +291,39 @@ class ImprovedDriverDetector:
         vertical   = np.linalg.norm(mouth_landmarks[2] - mouth_landmarks[3])  # 13 -> 14
         mar = vertical / (horizontal + 1e-6)
         return mar
-    
+
+    def calculate_face_direction(self, landmarks, frame_shape):
+        """Tinh huong nhin cua khuon mat tu FaceMesh landmarks.
+
+        Dung do doi xung trai-phai cua khuon mat de xac dinh
+        nguoi dang nhin thang hay quay sang ben.
+
+        Nose tip (1) nam giua left cheek (234) va right cheek (454).
+        Neu nhin thang: nose o giua -> ratio ~ 0.5
+        Neu quay trai: nose gan left cheek -> ratio < 0.5
+        Neu quay phai: nose gan right cheek -> ratio > 0.5
+
+        Returns:
+            face_ratio (float): 0.5 = thang, <0.4 hoac >0.6 = quay dau
+            is_facing_forward (bool): True neu dang nhin thang
+        """
+        h, w = frame_shape[:2]
+
+        nose = np.array([landmarks[1].x * w, landmarks[1].y * h])
+        left_cheek = np.array([landmarks[234].x * w, landmarks[234].y * h])
+        right_cheek = np.array([landmarks[454].x * w, landmarks[454].y * h])
+
+        face_width = np.linalg.norm(right_cheek - left_cheek) + 1e-6
+        nose_to_left = np.linalg.norm(nose - left_cheek)
+
+        # ratio: 0 = nose sat left, 1 = nose sat right, 0.5 = giua
+        face_ratio = nose_to_left / face_width
+
+        # Nhin thang: ratio trong khoang 0.35 - 0.65
+        is_facing_forward = 0.35 < face_ratio < 0.65
+
+        return face_ratio, is_facing_forward
+
     def extract_facial_metrics(self, frame, face_landmarks):
         """
         Extract EAR and MAR from face landmarks
@@ -335,12 +385,17 @@ class ImprovedDriverDetector:
         if is_yawning and not self.was_yawning:
             self.yawn_counter += 1
         self.was_yawning = is_yawning
-        
+
+        # Face direction
+        face_ratio, is_facing_forward = self.calculate_face_direction(landmarks, frame.shape)
+
         return {
             'ear': avg_ear,
             'mar': mar,
             'is_drowsy': is_drowsy,
             'is_yawning': is_yawning,
+            'is_facing_forward': is_facing_forward,
+            'face_ratio': face_ratio,
             'left_eye': left_eye,
             'right_eye': right_eye,
             'mouth': mouth
@@ -418,47 +473,55 @@ class ImprovedDriverDetector:
     
     def fuse_prediction(self, predicted_class, confidence, facial_metrics):
         """
-        Ket hop ket qua model CNN voi chi so EAR/MAR.
+        Ket hop ket qua model CNN voi chi so EAR/MAR/Face Direction.
 
-        Nguyen tac:
-        - Model CNN la nguon chinh; EAR/MAR chi *ho tro* dieu chinh 2 class
-          lien quan truc tiep (SleepyDriving va Yawn).
-        - Cac class khac (DangerousDriving, Distracted, Drinking, Safe)
-          hoan toan do model quyet dinh.
-        - Khong ep ve SafeDriving khi confidence thap – de model tu quyet dinh;
-          smooth_predictions da lam nhiem vu on dinh.
+        QUAN TRONG: Model bi bias nang sang Distracted khi dung webcam.
+        Dung sensor (EAR + face direction) de override:
+        - Mat mo + nhin thang + mieng binh thuong = SAFE bat ke model noi gi.
+        - Chi tin model bao Distracted khi nguoi that su QUAY DAU di.
         """
         if facial_metrics is None:
             return predicted_class, confidence
 
         ear_drowsy = facial_metrics['is_drowsy']
         mar_yawning = facial_metrics['is_yawning']
+        is_facing_forward = facial_metrics.get('is_facing_forward', True)
 
-        # BOOST: EAR/MAR xac nhan -> tang confidence
+        # ======================================================
+        # RULE 1 (HIGHEST PRIORITY): Mat mo + nhin thang = SAFE
+        # Override model Distracted khi sensor chung minh dang tap trung
+        # ======================================================
+        if predicted_class == 1 and is_facing_forward and not ear_drowsy and not mar_yawning:
+            return 3, confidence  # Ep ve SafeDriving
+
+        # ======================================================
+        # RULE 2: Boost khi sensor xac nhan model
+        # ======================================================
         if predicted_class == 4 and ear_drowsy:
             confidence = min(confidence * 1.3, 1.0)
         if predicted_class == 5 and mar_yawning:
             confidence = min(confidence * 1.3, 1.0)
 
-        # 1. Model bao buon ngu (4) nhung mat van mo binh thuong -> ha cap
+        # ======================================================
+        # RULE 3: Downgrade khi sensor khong dong y (confidence thap)
+        # ======================================================
         if predicted_class == 4 and not ear_drowsy:
-            # Chi ha cap neu confidence thap; confidence cao thi tin model
             if confidence < 0.60:
-                return 3, confidence  # SafeDriving
-
-        # 2. Model bao ngap (5) nhung mieng dong -> ha cap
+                return 3, confidence
         if predicted_class == 5 and not mar_yawning:
             if confidence < 0.60:
-                return 3, confidence  # SafeDriving
+                return 3, confidence
 
-        # 3. EAR thap lien tuc (nhieu frame) nhung model khong nhan ra
-        #    -> nang cap len buon ngu
+        # ======================================================
+        # RULE 4: Override khi sensor phat hien nhung model khong nhan ra
+        # ======================================================
+        # EAR thap lien tuc -> buon ngu
         if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD // 2 and predicted_class == 3:
-            return 4, confidence  # SleepyDriving
+            return 4, confidence
 
-        # 4. MAR cao (dang ngap) nhung model khong nhan ra
+        # MAR cao -> ngap
         if mar_yawning and predicted_class == 3:
-            return 5, confidence  # Yawn
+            return 5, confidence
 
         return predicted_class, confidence
 
@@ -467,14 +530,15 @@ class ImprovedDriverDetector:
 
         Recent frames get higher weight so the display reacts quickly
         while still filtering single-frame noise.
-        alpha = 0.6 means current frame contributes 60 %, history 40 %.
+        alpha = 0.45 means current frame contributes 45 %, history 55 %.
+        Gia tri nay giam nhay cam voi noise trong khi van phan ung kip.
         """
         self.prediction_history.append(prediction)
 
         if len(self.prediction_history) < 2:
             return prediction
 
-        alpha = 0.6  # weight for the most recent frame
+        alpha = 0.45  # giam tu 0.6 -> 0.45 de loc noise tot hon
         recent = np.array(list(self.prediction_history))
 
         # Build exponential weights: oldest → newest
@@ -486,20 +550,49 @@ class ImprovedDriverDetector:
         return smoothed
 
     def stabilize_class(self, predicted_class, confidence):
-        """Yeu cau class phai thang lien tuc STABILITY_FRAMES frame moi chuyen.
+        """Hysteresis-based stability filter voi confidence gate.
 
-        Tranh nhay lung tung giua cac class khi model dao dong.
-        Class nguy hiem (0-DangerousDriving, 4-SleepyDriving) duoc chuyen
-        nhanh hon (chi can 2 frame) de dam bao canh bao kip thoi.
+        - Khi CHUYEN VAO class moi: can STABILITY_ENTER[class] frame lien tuc
+          VA confidence phai vuot nguong toi thieu.
+        - Khi ROI KHOI class hien tai: can STABILITY_EXIT[class] frame lien tuc.
+        - Distracted (1) can confidence >= 0.45 moi duoc xet, tranh false positive
+          khi ngoi im nhin thang.
         """
-        # Class nguy hiem can it frame hon de phan ung nhanh
-        required = 2 if predicted_class in (0, 4) else self.STABILITY_FRAMES
+        # Confidence gate: class nay can confidence toi thieu bao nhieu
+        # moi duoc xet la "candidate" hop le
+        MIN_CONFIDENCE = {
+            0: 0.30,  # DangerousDriving  -> nguy hiem, nguong thap
+            1: 0.45,  # Distracted        -> HAY BI FALSE POSITIVE, nguong cao
+            2: 0.40,  # Drinking
+            3: 0.25,  # Safe              -> de ve safe
+            4: 0.30,  # SleepyDriving     -> nguy hiem, nguong thap
+            5: 0.35,  # Yawn
+        }
+
+        min_conf = MIN_CONFIDENCE.get(predicted_class, 0.35)
+
+        # Neu confidence khong du -> coi nhu giu nguyen class cu
+        if confidence < min_conf:
+            # Reset candidate neu dang dem cho class nay
+            if predicted_class == self.candidate_class:
+                self.candidate_class = self.stable_class
+                self.candidate_count = 0
+            return self.stable_class, self.stable_confidence
 
         if predicted_class == self.candidate_class:
             self.candidate_count += 1
         else:
             self.candidate_class = predicted_class
             self.candidate_count = 1
+
+        # Giu nguyen class hien tai -> khong can lam gi
+        if predicted_class == self.stable_class:
+            return self.stable_class, self.stable_confidence
+
+        # Dang muon chuyen sang class moi
+        exit_frames = self.STABILITY_EXIT.get(self.stable_class, self.STABILITY_FRAMES)
+        enter_frames = self.STABILITY_ENTER.get(predicted_class, self.STABILITY_FRAMES)
+        required = max(enter_frames, exit_frames)
 
         if self.candidate_count >= required:
             self.stable_class = self.candidate_class
@@ -731,9 +824,9 @@ class ImprovedDriverDetector:
                     predictions = self.model.predict(face_input, verbose=0)
                     inference_time = time.time() - inference_start
                     self.inference_times.append(inference_time)
-                    
+
                     smoothed_predictions = self.smooth_predictions(predictions[0])
-                    
+
                     predicted_class = np.argmax(smoothed_predictions)
                     confidence = float(smoothed_predictions[predicted_class])
 
