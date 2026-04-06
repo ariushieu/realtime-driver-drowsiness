@@ -1,0 +1,45 @@
+======================================================================
+BENCHMARK RESULTS - EfficientNet-B1
+Generated: 2026-04-06 19:16:06
+======================================================================
+
+MODEL INFORMATION
+----------------------------------------------------------------------
+Variant: EfficientNet-B1
+Weights: B1_16_batches.weights.keras
+Input Size: 224x224x3
+Framework: TensorFlow/Keras
+
+PROCESSING STATISTICS
+----------------------------------------------------------------------
+Frames Processed: 300/300
+Faces Detected: 263 (87.7%)
+
+INFERENCE PERFORMANCE
+----------------------------------------------------------------------
+Average Inference Time: 127.10 ms
+Standard Deviation: 177.53 ms
+Minimum: 101.36 ms
+Maximum: 2995.10 ms
+
+FPS PERFORMANCE
+----------------------------------------------------------------------
+Average FPS: 16.03
+Standard Deviation: 30.11
+Minimum FPS: 0.33
+Maximum FPS: 172.34
+
+COMPONENT BREAKDOWN
+----------------------------------------------------------------------
+Face Detection:     3.31 ms
+FaceMesh + EAR/MAR: 13.74 ms
+Preprocessing:      3.98 ms
+Model Inference:    127.10 ms
+Fusion+Stabilize:   0.17 ms
+Total Pipeline:     140.46 ms
+
+SYSTEM INFORMATION
+----------------------------------------------------------------------
+TensorFlow Version: 2.21.0
+OpenCV Version: 4.11.0
+NumPy Version: 2.2.6
