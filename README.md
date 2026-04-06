@@ -427,22 +427,6 @@ Precision: 93.4%  |  Recall: 93.2%  |  F1-Score: 93.3%
 
 ---
 
-## 👥 Nhóm thực hiện
-
-**Đề tài NCKH - Năm học 2025-2026**
-
-| Thành viên           | Vai trò                  | Email                |
-| -------------------- | ------------------------ | -------------------- |
-| **Nguyễn Quốc Hiếu** | Trưởng nhóm, ML Engineer | hieu.nq@example.com  |
-| **Nguyễn Tiến Hiệp** | Backend Developer        | hiep.nt@example.com  |
-| **Vũ Văn Quốc**      | Frontend Developer       | quoc.vv@example.com  |
-| **Phạm Văn Quyết**   | Data Engineer            | quyet.pv@example.com |
-
-**Giảng viên hướng dẫn:** TS. Vũ Ngọc Phan
-
-**Đơn vị:** Khoa Công Nghệ Thông Tin - Trường Đại học Tài Nguyên và Môi Trường Hà Nội
-
----
 
 ## 🔧 Troubleshooting
 
@@ -542,8 +526,6 @@ MIT License - Xem file [LICENSE](LICENSE) để biết thêm chi tiết.
 - Google MediaPipe team for the excellent face detection models
 - TensorFlow/Keras team for the EfficientNet implementation
 - Kaggle community for the driver drowsiness dataset
-- TS. Vũ Ngọc Phan for guidance and support
-
 ---
 
 ## 📞 Liên hệ
