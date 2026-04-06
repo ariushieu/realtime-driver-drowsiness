@@ -14,7 +14,16 @@ import tensorflow as tf
 import time
 from collections import deque
 import os
+import threading
 import mediapipe as mp
+
+# Sound alert: Windows built-in (no external files needed)
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
+    print("⚠️  winsound not available (non-Windows). Sound alerts disabled.")
 
 # Disable GPU to force CPU usage (remove if you have GPU)
 # tf.config.set_visible_devices([], 'GPU')
@@ -620,7 +629,40 @@ class ImprovedDriverDetector:
             return True
         
         return False
-    
+
+    def _play_alert_sound(self, predicted_class):
+        """Play alert sound on background thread (non-blocking).
+
+        Sound patterns:
+        - Critical (class 0, 4): 3 rapid high beeps (urgent)
+        - Warning  (class 1, 5): 2 medium beeps
+        - Drowsy frames long:    continuous alarm tone
+        """
+        if not HAS_WINSOUND:
+            return
+
+        def _beep():
+            try:
+                is_critical = predicted_class in (0, 4)
+                is_drowsy_long = self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD
+
+                if is_critical or is_drowsy_long:
+                    # Urgent: 3 rapid high-pitch beeps
+                    for _ in range(3):
+                        winsound.Beep(1200, 200)   # 1200 Hz, 200ms
+                        time.sleep(0.05)
+                else:
+                    # Warning: 2 medium beeps
+                    for _ in range(2):
+                        winsound.Beep(800, 250)    # 800 Hz, 250ms
+                        time.sleep(0.1)
+            except Exception:
+                pass  # Ignore sound errors silently
+
+        # Run on daemon thread so it doesn't block video loop
+        t = threading.Thread(target=_beep, daemon=True)
+        t.start()
+
     def draw_facial_features(self, frame, facial_metrics):
         """Draw landmarks in Tech/Sci-fi style (Dots + Thin Lines)"""
         if not facial_metrics:
@@ -1112,6 +1154,7 @@ class ImprovedDriverDetector:
                         print(f"🚨 ALERT: {class_names[predicted_class]} detected!")
                         if facial_metrics and facial_metrics['is_drowsy']:
                             print(f"   Eyes closed for {self.drowsy_frames} frames!")
+                        self._play_alert_sound(predicted_class)
                 
                 # Draw UI
                 self.draw_ui(frame, faces, predictions_data, facial_metrics,
