@@ -14,17 +14,16 @@ import tensorflow as tf
 import time
 from collections import deque
 import os
+import threading
 import mediapipe as mp
 
-try:
-    import simpleaudio as sa
-except ImportError:
-    sa = None
-
+# Sound alert: Windows built-in (no external files needed)
 try:
     import winsound
+    HAS_WINSOUND = True
 except ImportError:
-    winsound = None
+    HAS_WINSOUND = False
+    print("⚠️  winsound not available (non-Windows). Sound alerts disabled.")
 
 # Disable GPU to force CPU usage (remove if you have GPU)
 # tf.config.set_visible_devices([], 'GPU')
@@ -88,7 +87,7 @@ class ImprovedDriverDetector:
         # Performance tracking
         self.fps_counter = deque(maxlen=30)
         self.inference_times = deque(maxlen=10)
-        self.prediction_history = deque(maxlen=5)
+        self.prediction_history = deque(maxlen=8)  # tang buffer de smooth tot hon
         
         # Drowsiness metrics
         self.ear_history = deque(maxlen=20)  # Eye Aspect Ratio history
@@ -118,7 +117,25 @@ class ImprovedDriverDetector:
         self.stable_confidence = 0.0
         self.candidate_class = 3       # class dang "cho" du frame
         self.candidate_count = 0       # so frame lien tuc cua candidate
-        self.STABILITY_FRAMES = 3      # can 3 frame lien tuc moi chuyen class
+        self.STABILITY_FRAMES = 4      # can 4 frame lien tuc moi chuyen class (non-critical)
+
+        # Hysteresis: can nhieu frame hon de ROI KHOI trang thai nguy hiem,
+        # it frame hon de VAO trang thai nguy hiem
+        self.STABILITY_ENTER = {       # frame can de CHUYEN VAO class nay
+            0: 2,  # DangerousDriving  -> vao nhanh
+            1: 6,  # Distracted        -> can 6 frame lien tuc moi bao mat tap trung
+            2: 4,  # Drinking          -> can 4 frame
+            3: 3,  # Safe              -> ve safe cung can 3 frame (tranh nhay)
+            4: 2,  # SleepyDriving     -> vao nhanh
+            5: 3,  # Yawn              -> 3 frame
+        }
+        self.STABILITY_EXIT = {        # frame can de ROI KHOI class nay ve Safe
+            0: 5,  # DangerousDriving  -> roi cham (an toan)
+            1: 3,  # Distracted        -> roi de hon vao
+            2: 3,  # Drinking
+            4: 5,  # SleepyDriving     -> roi cham
+            5: 4,  # Yawn
+        }
 
         # Alert system
         self.last_alert_time = 0
@@ -318,7 +335,39 @@ class ImprovedDriverDetector:
         vertical   = np.linalg.norm(mouth_landmarks[2] - mouth_landmarks[3])  # 13 -> 14
         mar = vertical / (horizontal + 1e-6)
         return mar
-    
+
+    def calculate_face_direction(self, landmarks, frame_shape):
+        """Tinh huong nhin cua khuon mat tu FaceMesh landmarks.
+
+        Dung do doi xung trai-phai cua khuon mat de xac dinh
+        nguoi dang nhin thang hay quay sang ben.
+
+        Nose tip (1) nam giua left cheek (234) va right cheek (454).
+        Neu nhin thang: nose o giua -> ratio ~ 0.5
+        Neu quay trai: nose gan left cheek -> ratio < 0.5
+        Neu quay phai: nose gan right cheek -> ratio > 0.5
+
+        Returns:
+            face_ratio (float): 0.5 = thang, <0.4 hoac >0.6 = quay dau
+            is_facing_forward (bool): True neu dang nhin thang
+        """
+        h, w = frame_shape[:2]
+
+        nose = np.array([landmarks[1].x * w, landmarks[1].y * h])
+        left_cheek = np.array([landmarks[234].x * w, landmarks[234].y * h])
+        right_cheek = np.array([landmarks[454].x * w, landmarks[454].y * h])
+
+        face_width = np.linalg.norm(right_cheek - left_cheek) + 1e-6
+        nose_to_left = np.linalg.norm(nose - left_cheek)
+
+        # ratio: 0 = nose sat left, 1 = nose sat right, 0.5 = giua
+        face_ratio = nose_to_left / face_width
+
+        # Nhin thang: ratio trong khoang 0.35 - 0.65
+        is_facing_forward = 0.35 < face_ratio < 0.65
+
+        return face_ratio, is_facing_forward
+
     def extract_facial_metrics(self, frame, face_landmarks):
         """
         Extract EAR and MAR from face landmarks
@@ -380,12 +429,17 @@ class ImprovedDriverDetector:
         if is_yawning and not self.was_yawning:
             self.yawn_counter += 1
         self.was_yawning = is_yawning
-        
+
+        # Face direction
+        face_ratio, is_facing_forward = self.calculate_face_direction(landmarks, frame.shape)
+
         return {
             'ear': avg_ear,
             'mar': mar,
             'is_drowsy': is_drowsy,
             'is_yawning': is_yawning,
+            'is_facing_forward': is_facing_forward,
+            'face_ratio': face_ratio,
             'left_eye': left_eye,
             'right_eye': right_eye,
             'mouth': mouth
@@ -463,47 +517,55 @@ class ImprovedDriverDetector:
     
     def fuse_prediction(self, predicted_class, confidence, facial_metrics):
         """
-        Ket hop ket qua model CNN voi chi so EAR/MAR.
+        Ket hop ket qua model CNN voi chi so EAR/MAR/Face Direction.
 
-        Nguyen tac:
-        - Model CNN la nguon chinh; EAR/MAR chi *ho tro* dieu chinh 2 class
-          lien quan truc tiep (SleepyDriving va Yawn).
-        - Cac class khac (DangerousDriving, Distracted, Drinking, Safe)
-          hoan toan do model quyet dinh.
-        - Khong ep ve SafeDriving khi confidence thap – de model tu quyet dinh;
-          smooth_predictions da lam nhiem vu on dinh.
+        QUAN TRONG: Model bi bias nang sang Distracted khi dung webcam.
+        Dung sensor (EAR + face direction) de override:
+        - Mat mo + nhin thang + mieng binh thuong = SAFE bat ke model noi gi.
+        - Chi tin model bao Distracted khi nguoi that su QUAY DAU di.
         """
         if facial_metrics is None:
             return predicted_class, confidence
 
         ear_drowsy = facial_metrics['is_drowsy']
         mar_yawning = facial_metrics['is_yawning']
+        is_facing_forward = facial_metrics.get('is_facing_forward', True)
 
-        # BOOST: EAR/MAR xac nhan -> tang confidence
+        # ======================================================
+        # RULE 1 (HIGHEST PRIORITY): Mat mo + nhin thang = SAFE
+        # Override model Distracted khi sensor chung minh dang tap trung
+        # ======================================================
+        if predicted_class == 1 and is_facing_forward and not ear_drowsy and not mar_yawning:
+            return 3, confidence  # Ep ve SafeDriving
+
+        # ======================================================
+        # RULE 2: Boost khi sensor xac nhan model
+        # ======================================================
         if predicted_class == 4 and ear_drowsy:
             confidence = min(confidence * 1.3, 1.0)
         if predicted_class == 5 and mar_yawning:
             confidence = min(confidence * 1.3, 1.0)
 
-        # 1. Model bao buon ngu (4) nhung mat van mo binh thuong -> ha cap
+        # ======================================================
+        # RULE 3: Downgrade khi sensor khong dong y (confidence thap)
+        # ======================================================
         if predicted_class == 4 and not ear_drowsy:
-            # Chi ha cap neu confidence thap; confidence cao thi tin model
             if confidence < 0.60:
-                return 3, confidence  # SafeDriving
-
-        # 2. Model bao ngap (5) nhung mieng dong -> ha cap
+                return 3, confidence
         if predicted_class == 5 and not mar_yawning:
             if confidence < 0.60:
-                return 3, confidence  # SafeDriving
+                return 3, confidence
 
-        # 3. EAR thap lien tuc (nhieu frame) nhung model khong nhan ra
-        #    -> nang cap len buon ngu
+        # ======================================================
+        # RULE 4: Override khi sensor phat hien nhung model khong nhan ra
+        # ======================================================
+        # EAR thap lien tuc -> buon ngu
         if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD // 2 and predicted_class == 3:
-            return 4, confidence  # SleepyDriving
+            return 4, confidence
 
-        # 4. MAR cao (dang ngap) nhung model khong nhan ra
+        # MAR cao -> ngap
         if mar_yawning and predicted_class == 3:
-            return 5, confidence  # Yawn
+            return 5, confidence
 
         return predicted_class, confidence
 
@@ -512,14 +574,15 @@ class ImprovedDriverDetector:
 
         Recent frames get higher weight so the display reacts quickly
         while still filtering single-frame noise.
-        alpha = 0.6 means current frame contributes 60 %, history 40 %.
+        alpha = 0.45 means current frame contributes 45 %, history 55 %.
+        Gia tri nay giam nhay cam voi noise trong khi van phan ung kip.
         """
         self.prediction_history.append(prediction)
 
         if len(self.prediction_history) < 2:
             return prediction
 
-        alpha = 0.6  # weight for the most recent frame
+        alpha = 0.45  # giam tu 0.6 -> 0.45 de loc noise tot hon
         recent = np.array(list(self.prediction_history))
 
         # Build exponential weights: oldest → newest
@@ -531,20 +594,49 @@ class ImprovedDriverDetector:
         return smoothed
 
     def stabilize_class(self, predicted_class, confidence):
-        """Yeu cau class phai thang lien tuc STABILITY_FRAMES frame moi chuyen.
+        """Hysteresis-based stability filter voi confidence gate.
 
-        Tranh nhay lung tung giua cac class khi model dao dong.
-        Class nguy hiem (0-DangerousDriving, 4-SleepyDriving) duoc chuyen
-        nhanh hon (chi can 2 frame) de dam bao canh bao kip thoi.
+        - Khi CHUYEN VAO class moi: can STABILITY_ENTER[class] frame lien tuc
+          VA confidence phai vuot nguong toi thieu.
+        - Khi ROI KHOI class hien tai: can STABILITY_EXIT[class] frame lien tuc.
+        - Distracted (1) can confidence >= 0.45 moi duoc xet, tranh false positive
+          khi ngoi im nhin thang.
         """
-        # Class nguy hiem can it frame hon de phan ung nhanh
-        required = 2 if predicted_class in (0, 4) else self.STABILITY_FRAMES
+        # Confidence gate: class nay can confidence toi thieu bao nhieu
+        # moi duoc xet la "candidate" hop le
+        MIN_CONFIDENCE = {
+            0: 0.30,  # DangerousDriving  -> nguy hiem, nguong thap
+            1: 0.45,  # Distracted        -> HAY BI FALSE POSITIVE, nguong cao
+            2: 0.40,  # Drinking
+            3: 0.25,  # Safe              -> de ve safe
+            4: 0.30,  # SleepyDriving     -> nguy hiem, nguong thap
+            5: 0.35,  # Yawn
+        }
+
+        min_conf = MIN_CONFIDENCE.get(predicted_class, 0.35)
+
+        # Neu confidence khong du -> coi nhu giu nguyen class cu
+        if confidence < min_conf:
+            # Reset candidate neu dang dem cho class nay
+            if predicted_class == self.candidate_class:
+                self.candidate_class = self.stable_class
+                self.candidate_count = 0
+            return self.stable_class, self.stable_confidence
 
         if predicted_class == self.candidate_class:
             self.candidate_count += 1
         else:
             self.candidate_class = predicted_class
             self.candidate_count = 1
+
+        # Giu nguyen class hien tai -> khong can lam gi
+        if predicted_class == self.stable_class:
+            return self.stable_class, self.stable_confidence
+
+        # Dang muon chuyen sang class moi
+        exit_frames = self.STABILITY_EXIT.get(self.stable_class, self.STABILITY_FRAMES)
+        enter_frames = self.STABILITY_ENTER.get(predicted_class, self.STABILITY_FRAMES)
+        required = max(enter_frames, exit_frames)
 
         if self.candidate_count >= required:
             self.stable_class = self.candidate_class
@@ -572,7 +664,40 @@ class ImprovedDriverDetector:
             return True
         
         return False
-    
+
+    def _play_alert_sound(self, predicted_class):
+        """Play alert sound on background thread (non-blocking).
+
+        Sound patterns:
+        - Critical (class 0, 4): 3 rapid high beeps (urgent)
+        - Warning  (class 1, 5): 2 medium beeps
+        - Drowsy frames long:    continuous alarm tone
+        """
+        if not HAS_WINSOUND:
+            return
+
+        def _beep():
+            try:
+                is_critical = predicted_class in (0, 4)
+                is_drowsy_long = self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD
+
+                if is_critical or is_drowsy_long:
+                    # Urgent: 3 rapid high-pitch beeps
+                    for _ in range(3):
+                        winsound.Beep(1200, 200)   # 1200 Hz, 200ms
+                        time.sleep(0.05)
+                else:
+                    # Warning: 2 medium beeps
+                    for _ in range(2):
+                        winsound.Beep(800, 250)    # 800 Hz, 250ms
+                        time.sleep(0.1)
+            except Exception:
+                pass  # Ignore sound errors silently
+
+        # Run on daemon thread so it doesn't block video loop
+        t = threading.Thread(target=_beep, daemon=True)
+        t.start()
+
     def draw_facial_features(self, frame, facial_metrics):
         """Draw landmarks in Tech/Sci-fi style (Dots + Thin Lines)"""
         if not facial_metrics:
@@ -613,107 +738,372 @@ class ImprovedDriverDetector:
         for pt in mouth_poly:
             cv2.circle(frame, tuple(pt), 2, mouth_color, -1, cv2.LINE_AA)
     
-    def draw_ui(self, frame, faces, predictions_data, facial_metrics=None):
-        """Draw enhanced UI"""
+    # ================================================================
+    #  DASHBOARD UI — Professional display for NCKH demo
+    # ================================================================
+
+    def _draw_semi_rect(self, frame, pt1, pt2, color, alpha=0.7):
+        """Draw semi-transparent filled rectangle"""
+        overlay = frame.copy()
+        cv2.rectangle(overlay, pt1, pt2, color, -1)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    def _draw_corner_bbox(self, frame, x, y, fw, fh, color, thickness=2):
+        """Draw sci-fi corner bracket bounding box"""
+        corner_len = max(15, min(fw, fh) // 5)
+
+        # Top-left
+        cv2.line(frame, (x, y), (x + corner_len, y), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x, y), (x, y + corner_len), color, thickness, cv2.LINE_AA)
+        # Top-right
+        cv2.line(frame, (x + fw, y), (x + fw - corner_len, y), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x + fw, y), (x + fw, y + corner_len), color, thickness, cv2.LINE_AA)
+        # Bottom-left
+        cv2.line(frame, (x, y + fh), (x + corner_len, y + fh), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x, y + fh), (x, y + fh - corner_len), color, thickness, cv2.LINE_AA)
+        # Bottom-right
+        cv2.line(frame, (x + fw, y + fh), (x + fw - corner_len, y + fh), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x + fw, y + fh), (x + fw, y + fh - corner_len), color, thickness, cv2.LINE_AA)
+
+        # Thin connecting lines between corners (subtle)
+        thin = max(1, thickness - 1)
+        cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, thin, cv2.LINE_AA)
+
+    def _draw_header(self, frame):
+        """Draw top header bar with system name, FPS, time"""
         h, w = frame.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
-        
-        # Draw faces and predictions
+
+        # Semi-transparent dark header (40px tall)
+        self._draw_semi_rect(frame, (0, 0), (w, 42), (20, 20, 20), 0.80)
+
+        # Accent line at bottom of header
+        cv2.line(frame, (0, 42), (w, 42), (0, 200, 200), 1, cv2.LINE_AA)
+
+        # Left: System name
+        cv2.putText(frame, "AI DRIVER MONITORING SYSTEM",
+                    (12, 28), font, 0.65, (0, 230, 230), 2, cv2.LINE_AA)
+
+        # Right: FPS
+        fps_text = ""
+        if self.fps_counter:
+            fps_val = np.mean(self.fps_counter)
+            fps_text = f"FPS: {fps_val:.0f}"
+            fps_color = (0, 255, 0) if fps_val >= 10 else (0, 165, 255)
+            cv2.putText(frame, fps_text, (w - 260, 28), font, 0.55,
+                        fps_color, 2, cv2.LINE_AA)
+
+        # Right: inference time
+        if self.inference_times:
+            ms = np.mean(self.inference_times) * 1000
+            cv2.putText(frame, f"{ms:.0f}ms", (w - 175, 28), font, 0.50,
+                        (180, 180, 180), 1, cv2.LINE_AA)
+
+        # Right: Clock
+        clock_text = time.strftime("%H:%M:%S")
+        cv2.putText(frame, clock_text, (w - 110, 28), font, 0.55,
+                    (200, 200, 200), 1, cv2.LINE_AA)
+
+    def _draw_metrics_panel(self, frame, facial_metrics):
+        """Draw left-side metrics panel with semi-transparent background"""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        px, py = 8, 52          # top-left of panel
+        pw, line_h = 195, 26    # panel width, line height
+
+        if facial_metrics is None:
+            # No face detected — show message
+            panel_h = 40
+            self._draw_semi_rect(frame, (px, py), (px + pw, py + panel_h),
+                                 (20, 20, 20), 0.65)
+            cv2.putText(frame, "Khong phat hien khuon mat",
+                        (px + 8, py + 26), font, 0.42, (100, 100, 100), 1, cv2.LINE_AA)
+            return
+
+        # Compute how many rows
+        rows = 7  # EAR, MAR, Blinks, Yawns, Direction, Ratio, + header
+        if not self.is_calibrated:
+            rows += 1
+        panel_h = 8 + rows * line_h + 8
+
+        # Panel background
+        self._draw_semi_rect(frame, (px, py), (px + pw, py + panel_h),
+                             (20, 20, 20), 0.65)
+
+        # Panel title
+        cy = py + 20
+        cv2.putText(frame, "CHI SO KHUON MAT", (px + 8, cy), font, 0.45,
+                    (0, 200, 200), 1, cv2.LINE_AA)
+        cy += 4
+        cv2.line(frame, (px + 8, cy), (px + pw - 8, cy), (60, 60, 60), 1)
+        cy += line_h - 4
+
+        # Calibration warning
+        if not self.is_calibrated:
+            remaining = self.CALIBRATION_FRAMES - len(self.calibration_ear_buffer)
+            cv2.putText(frame, f"Calibrating... {remaining}f",
+                        (px + 8, cy), font, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
+            cy += line_h
+
+        # EAR
+        ear_val = facial_metrics['ear']
+        ear_color = (0, 0, 255) if self.drowsy_frames > 3 else (0, 255, 100)
+        cv2.putText(frame, "EAR:", (px + 8, cy), font, 0.45,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{ear_val:.3f}", (px + 55, cy), font, 0.50,
+                    ear_color, 2, cv2.LINE_AA)
+        # Mini bar for EAR (0-0.5 range)
+        bar_x = px + 115
+        bar_w = 70
+        bar_fill = int(bar_w * min(ear_val / 0.40, 1.0))
+        cv2.rectangle(frame, (bar_x, cy - 10), (bar_x + bar_w, cy - 2),
+                      (50, 50, 50), -1)
+        cv2.rectangle(frame, (bar_x, cy - 10), (bar_x + bar_fill, cy - 2),
+                      ear_color, -1)
+        cy += line_h
+
+        # MAR
+        mar_val = facial_metrics['mar']
+        mar_color = (0, 140, 255) if facial_metrics['is_yawning'] else (0, 255, 100)
+        mar_label = " NGAP!" if facial_metrics['is_yawning'] else ""
+        cv2.putText(frame, "MAR:", (px + 8, cy), font, 0.45,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{mar_val:.3f}{mar_label}", (px + 55, cy), font, 0.50,
+                    mar_color, 2, cv2.LINE_AA)
+        cy += line_h
+
+        # Blink count
+        cv2.putText(frame, "Nhay mat:", (px + 8, cy), font, 0.42,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{self.blink_counter}", (px + 100, cy), font, 0.50,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        cy += line_h
+
+        # Yawn count
+        cv2.putText(frame, "So lan ngap:", (px + 8, cy), font, 0.42,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{self.yawn_counter}", (px + 120, cy), font, 0.50,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        cy += line_h
+
+        # Face direction
+        is_forward = facial_metrics.get('is_facing_forward', True)
+        if is_forward:
+            dir_text = "Thang"
+            dir_icon = "<>"
+            dir_color = (0, 255, 100)
+        else:
+            dir_text = "Quay"
+            dir_icon = "><"
+            dir_color = (0, 140, 255)
+        cv2.putText(frame, "Huong:", (px + 8, cy), font, 0.42,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{dir_text} {dir_icon}", (px + 70, cy), font, 0.50,
+                    dir_color, 2, cv2.LINE_AA)
+        cy += line_h
+
+        # Face ratio
+        face_ratio = facial_metrics.get('face_ratio', 0.5)
+        cv2.putText(frame, "Ratio:", (px + 8, cy), font, 0.42,
+                    (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{face_ratio:.2f}", (px + 70, cy), font, 0.50,
+                    (200, 200, 200), 1, cv2.LINE_AA)
+        # Mini indicator: dot shows position on 0-1 scale
+        ind_x = px + 120
+        ind_w = 65
+        cv2.line(frame, (ind_x, cy - 5), (ind_x + ind_w, cy - 5),
+                 (60, 60, 60), 2, cv2.LINE_AA)
+        dot_x = ind_x + int(ind_w * face_ratio)
+        cv2.circle(frame, (dot_x, cy - 5), 4, dir_color, -1, cv2.LINE_AA)
+
+    def _draw_prob_bars(self, frame, all_probs, predicted_class):
+        """Draw compact probability bars on right side"""
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        bar_x = w - 215
+        bar_y_start = 56
+        bar_w = 90
+        bar_h = 14
+        gap = 5
+
+        # Panel background
+        self._draw_semi_rect(frame, (bar_x - 8, bar_y_start - 22),
+                             (w - 5, bar_y_start + 6 * (bar_h + gap) + 4),
+                             (20, 20, 20), 0.60)
+
+        cv2.putText(frame, "XAC SUAT DU DOAN", (bar_x - 2, bar_y_start - 8),
+                    font, 0.38, (0, 200, 200), 1, cv2.LINE_AA)
+
+        short_names = {
+            0: 'Nguy hiem',
+            1: 'Mat t.trung',
+            2: 'Uong nuoc',
+            3: 'An toan',
+            4: 'Buon ngu',
+            5: 'Ngap'
+        }
+
+        for cls_id, prob in enumerate(all_probs):
+            yp = bar_y_start + cls_id * (bar_h + gap)
+            filled = int(bar_w * float(prob))
+
+            # Background bar
+            cv2.rectangle(frame, (bar_x, yp), (bar_x + bar_w, yp + bar_h),
+                          (50, 50, 50), -1)
+
+            # Filled bar
+            fg_color = alert_config[cls_id]['color']
+            if cls_id == predicted_class:
+                # Brighten selected class
+                fg_color = tuple(min(255, c + 40) for c in fg_color)
+            cv2.rectangle(frame, (bar_x, yp), (bar_x + filled, yp + bar_h),
+                          fg_color, -1)
+
+            # Highlight border for predicted class
+            if cls_id == predicted_class:
+                cv2.rectangle(frame, (bar_x - 1, yp - 1),
+                              (bar_x + bar_w + 1, yp + bar_h + 1),
+                              (255, 255, 255), 1)
+
+            # Label + percentage
+            label = f"{short_names[cls_id]}: {prob:.0%}"
+            label_color = (255, 255, 255) if cls_id == predicted_class else (180, 180, 180)
+            cv2.putText(frame, label, (bar_x + bar_w + 6, yp + bar_h - 2),
+                        font, 0.35, label_color, 1, cv2.LINE_AA)
+
+    def _draw_status_bar(self, frame, predicted_class, confidence):
+        """Draw bottom status bar with current state"""
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        bar_h = 42
+
+        color = alert_config[predicted_class]['color']
+        level = alert_config[predicted_class]['level']
+        class_name = class_names[predicted_class]
+
+        # Semi-transparent status bar
+        self._draw_semi_rect(frame, (0, h - bar_h), (w, h), color, 0.55)
+
+        # Top accent line
+        cv2.line(frame, (0, h - bar_h), (w, h - bar_h), color, 2, cv2.LINE_AA)
+
+        # Status indicator circle
+        cv2.circle(frame, (22, h - bar_h // 2), 8, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (22, h - bar_h // 2), 6, color, -1, cv2.LINE_AA)
+
+        # Main status text
+        status_text = f"[{level}]  {class_name}  -  {confidence:.0%}"
+        cv2.putText(frame, status_text, (42, h - bar_h // 2 + 6),
+                    font, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Right side: detection method
+        method = "MediaPipe" if self.use_mediapipe else "Haar"
+        cv2.putText(frame, f"Engine: {method}", (w - 180, h - bar_h // 2 + 5),
+                    font, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+
+    def _draw_danger_alert(self, frame, predicted_class, frame_count):
+        """Draw flashing red border + banner for dangerous states"""
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Determine danger level
+        is_critical = predicted_class in (0, 4)  # Dangerous driving, Sleepy
+        is_warning = predicted_class in (1, 5)   # Distracted, Yawn
+        is_drowsy_long = self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD
+
+        if not (is_critical or is_drowsy_long or is_warning):
+            return
+
+        # Flash toggle (on for 4 frames, off for 4 frames)
+        flash_on = (frame_count % 8) < 4
+
+        if is_critical or is_drowsy_long:
+            border_color = (0, 0, 255)      # Red
+            banner_color = (0, 0, 180)
+            if is_drowsy_long:
+                banner_text = "CANH BAO: DANG BUON NGU!"
+            else:
+                banner_text = f"CANH BAO: {class_names[predicted_class].upper()}!"
+        else:
+            border_color = (0, 140, 255)    # Orange
+            banner_color = (0, 100, 200)
+            banner_text = f"CHU Y: {class_names[predicted_class].upper()}"
+
+        # Flashing border
+        if flash_on:
+            thickness = 6
+            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, thickness)
+            cv2.rectangle(frame, (thickness, thickness),
+                          (w - 1 - thickness, h - 1 - thickness),
+                          (255, 255, 255), 1)
+
+        # Center banner (always visible when in danger state)
+        (tw, th), _ = cv2.getTextSize(banner_text, font, 0.9, 2)
+        banner_w = tw + 60
+        banner_h = th + 30
+        bx = (w - banner_w) // 2
+        by = h // 2 - banner_h - 20
+
+        self._draw_semi_rect(frame, (bx, by), (bx + banner_w, by + banner_h),
+                             banner_color, 0.75)
+        cv2.rectangle(frame, (bx, by), (bx + banner_w, by + banner_h),
+                      border_color, 2, cv2.LINE_AA)
+
+        # Banner text
+        text_x = bx + 30
+        text_y = by + th + 12
+        if flash_on:
+            cv2.putText(frame, banner_text, (text_x, text_y), font, 0.9,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, banner_text, (text_x, text_y), font, 0.9,
+                        (200, 200, 200), 2, cv2.LINE_AA)
+
+    def draw_ui(self, frame, faces, predictions_data, facial_metrics=None,
+                frame_count=0):
+        """Draw professional dashboard UI for NCKH demo"""
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # 1. Header bar
+        self._draw_header(frame)
+
+        # 2. Metrics panel (left side)
+        self._draw_metrics_panel(frame, facial_metrics)
+
+        # 3. Process each detected face
+        current_class = 3
+        current_conf = 0.0
         for i, ((x, y, fw, fh), pred_data) in enumerate(zip(faces, predictions_data)):
             predicted_class, confidence, all_probs = pred_data
-            
-            alert_info = alert_config[predicted_class]
-            color = alert_info['color']
-            level = alert_info['level']
-            
-            # Draw face bounding box
-            thickness = 3 if level in ['CRITICAL', 'WARNING'] else 2
-            cv2.rectangle(frame, (x, y), (x+fw, y+fh), color, thickness)
+            current_class = predicted_class
+            current_conf = confidence
 
-            # Ve main label va cap do canh bao
+            color = alert_config[predicted_class]['color']
+
+            # Sci-fi corner bracket bbox
+            thickness = 3 if predicted_class in (0, 4) else 2
+            self._draw_corner_bbox(frame, x, y, fw, fh, color, thickness)
+
+            # Face label above bbox
             class_name = class_names[predicted_class]
-            main_text = f"{class_name} ({confidence:.0%})"
-            level_text = f"[{alert_info['level']}]"
+            label_text = f"{class_name} ({confidence:.0%})"
+            (lw, lh), _ = cv2.getTextSize(label_text, font, 0.55, 2)
 
-            font_scale = 0.65
-            text_thickness = 2
+            label_y = max(48, y - 8)
+            self._draw_semi_rect(frame, (x, label_y - lh - 6),
+                                 (x + lw + 12, label_y + 2), color, 0.70)
+            cv2.putText(frame, label_text, (x + 6, label_y - 4), font, 0.55,
+                        (255, 255, 255), 2, cv2.LINE_AA)
 
-            (text_w, text_h), _ = cv2.getTextSize(main_text, font, font_scale, text_thickness)
-            (level_w, level_h), _ = cv2.getTextSize(level_text, font, 0.5, 1)
+            # Probability bars (right side)
+            self._draw_prob_bars(frame, all_probs, predicted_class)
 
-            bg_y = max(0, y - text_h - level_h - 15)
-            cv2.rectangle(frame, (x, bg_y), (x + max(text_w, level_w) + 10, y), color, -1)
+        # 4. Status bar (bottom)
+        self._draw_status_bar(frame, current_class, current_conf)
 
-            cv2.putText(frame, main_text, (x+5, y-level_h-5), font, font_scale,
-                       (255, 255, 255), text_thickness)
-            cv2.putText(frame, level_text, (x+5, y-5), font, 0.5, (255, 255, 255), 1)
-
-            # Probability bars (ben phai man hinh)
-            bar_x = w - 230
-            bar_y_start = 50
-            bar_w = 100
-            bar_h = 14
-            cv2.putText(frame, "Xac suat:", (bar_x, bar_y_start - 12), font, 0.5,
-                       (200, 200, 200), 1)
-            for cls_id, prob in enumerate(all_probs):
-                yp = bar_y_start + cls_id * (bar_h + 4)
-                filled = int(bar_w * float(prob))
-                bg_color = (50, 50, 50)
-                fg_color = alert_config[cls_id]['color']
-                if cls_id == predicted_class:
-                    fg_color = color  # highlight selected
-                cv2.rectangle(frame, (bar_x, yp), (bar_x + bar_w, yp + bar_h), bg_color, -1)
-                cv2.rectangle(frame, (bar_x, yp), (bar_x + filled, yp + bar_h), fg_color, -1)
-                label = f"{list(class_names.values())[cls_id][:10]}: {prob:.0%}"
-                cv2.putText(frame, label, (bar_x + bar_w + 5, yp + bar_h - 1),
-                           font, 0.38, (220, 220, 220), 1)
-        
-        # Hien thi chi so khuon mat
-        if facial_metrics:
-            metrics_y = 100
-
-            # Hien thi trang thai calibration
-            if not self.is_calibrated:
-                remaining = self.CALIBRATION_FRAMES - len(self.calibration_ear_buffer)
-                cal_text = f"Calibrating... con {remaining} frames"
-                cv2.putText(frame, cal_text, (10, metrics_y - 25), font, 0.55,
-                           (0, 255, 255), 2)
-
-            ear_color = (0, 0, 255) if self.drowsy_frames > 3 else (0, 255, 0)
-            cv2.putText(frame, f"Mat (EAR): {facial_metrics['ear']:.3f}",
-                       (10, metrics_y), font, 0.6, ear_color, 2)
-
-            mar_color = (0, 165, 255) if facial_metrics['is_yawning'] else (0, 255, 0)
-            yawn_label = " [NGAP!]" if facial_metrics['is_yawning'] else ""
-            cv2.putText(frame, f"Mieng (MAR): {facial_metrics['mar']:.3f}{yawn_label}",
-                       (10, metrics_y + 30), font, 0.6, mar_color, 2)
-
-            cv2.putText(frame, f"Nhay mat: {self.blink_counter} lan",
-                       (10, metrics_y + 60), font, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame, f"Ngap: {self.yawn_counter} lan",
-                       (10, metrics_y + 90), font, 0.6, (255, 255, 255), 2)
-
-            # Canh bao buon ngu
-            if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD:
-                warning_text = "!!! DANG BUON NGU !!!"
-                (tw, th), _ = cv2.getTextSize(warning_text, font, 1.0, 3)
-                cv2.rectangle(frame, ((w - tw) // 2 - 10, h // 2 - th - 10),
-                             ((w + tw) // 2 + 10, h // 2 + 10), (0, 0, 200), -1)
-                cv2.putText(frame, warning_text, ((w - tw) // 2, h // 2),
-                           font, 1.0, (255, 255, 255), 3)
-
-        # Thong tin hieu suat
-        if self.fps_counter:
-            cv2.putText(frame, f"FPS: {np.mean(self.fps_counter):.1f}",
-                       (10, 30), font, 0.7, (0, 255, 0), 2)
-
-        if self.inference_times:
-            cv2.putText(frame, f"Xu ly: {np.mean(self.inference_times)*1000:.0f}ms",
-                       (10, 60), font, 0.7, (0, 255, 0), 2)
-
-        method = "MediaPipe" if self.use_mediapipe else "Haar"
-        cv2.putText(frame, f"Nhan dang: {method}", (w - 220, 30), font, 0.6,
-                   (255, 255, 255), 2)
+        # 5. Danger alert (flashing border + banner) — drawn LAST so it's on top
+        self._draw_danger_alert(frame, current_class, frame_count)
     
     def run(self):
         """Main application loop"""
@@ -724,8 +1114,8 @@ class ImprovedDriverDetector:
             print("❌ Error: Could not open webcam")
             return
         
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, 30)
         
         print("✅ System ready! Press 'q' to quit")
@@ -776,9 +1166,9 @@ class ImprovedDriverDetector:
                     predictions = self.model.predict(face_input, verbose=0)
                     inference_time = time.time() - inference_start
                     self.inference_times.append(inference_time)
-                    
+
                     smoothed_predictions = self.smooth_predictions(predictions[0])
-                    
+
                     predicted_class = np.argmax(smoothed_predictions)
                     confidence = float(smoothed_predictions[predicted_class])
 
@@ -799,16 +1189,18 @@ class ImprovedDriverDetector:
                         print(f"🚨 ALERT: {class_names[predicted_class]} detected!")
                         if facial_metrics and facial_metrics['is_drowsy']:
                             print(f"   Eyes closed for {self.drowsy_frames} frames!")
+                        self._play_alert_sound(predicted_class)
                 
                 # Draw UI
-                self.draw_ui(frame, faces, predictions_data, facial_metrics)
+                self.draw_ui(frame, faces, predictions_data, facial_metrics,
+                             frame_count)
                 
                 # Calculate FPS
                 frame_time = time.time() - start_time
                 fps = 1.0 / frame_time if frame_time > 0 else 0
                 self.fps_counter.append(fps)
                 
-                cv2.imshow('Driver Drowsiness Detection V2', frame)
+                cv2.imshow('AI Driver Monitoring System - NCKH 2025', frame)
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
