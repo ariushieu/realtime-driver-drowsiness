@@ -59,16 +59,16 @@ class ImprovedDriverDetector:
             use_mediapipe: Use MediaPipe for face detection (vs Haar Cascades)
             use_facemesh: Use FaceMesh for landmark detection (eyes, mouth tracking)
         """
-        # Auto-detect model weights: prefer B1, fallback to B0
+        # Auto-detect model weights: prefer B0, fallback to B1
         if model_path is None:
-            if os.path.exists("B1_16_batches.weights.keras"):
-                model_path = "B1_16_batches.weights.keras"
-            elif os.path.exists("B0_16_batches.weights.keras"):
+            if os.path.exists("B0_16_batches.weights.keras"):
                 model_path = "B0_16_batches.weights.keras"
+            elif os.path.exists("B1_16_batches.weights.keras"):
+                model_path = "B1_16_batches.weights.keras"
             else:
                 raise FileNotFoundError(
-                    "No model weights found. Expected B1_16_batches.weights.keras "
-                    "or B0_16_batches.weights.keras"
+                    "No model weights found. Expected B0_16_batches.weights.keras "
+                    "or B1_16_batches.weights.keras"
                 )
         self.model_path = model_path
         self.model = None
@@ -121,19 +121,19 @@ class ImprovedDriverDetector:
 
         # Hysteresis: can nhieu frame hon de ROI KHOI trang thai nguy hiem,
         # it frame hon de VAO trang thai nguy hiem
-        self.STABILITY_ENTER = {       # frame can de CHUYEN VAO class nay
-            0: 2,  # DangerousDriving  -> vao nhanh
-            1: 6,  # Distracted        -> can 6 frame lien tuc moi bao mat tap trung
-            2: 4,  # Drinking          -> can 4 frame
-            3: 3,  # Safe              -> ve safe cung can 3 frame (tranh nhay)
-            4: 2,  # SleepyDriving     -> vao nhanh
-            5: 3,  # Yawn              -> 3 frame
+        self.STABILITY_ENTER = {       
+            0: 2,  # DangerousDriving  
+            1: 6,  # Distracted        
+            2: 4,  # Drinking         
+            3: 3,  # Safe              
+            4: 2,  # SleepyDriving     
+            5: 3,  # Yawn              
         }
-        self.STABILITY_EXIT = {        # frame can de ROI KHOI class nay ve Safe
-            0: 5,  # DangerousDriving  -> roi cham (an toan)
-            1: 3,  # Distracted        -> roi de hon vao
+        self.STABILITY_EXIT = {        
+            0: 5,  # DangerousDriving  
+            1: 3,  # Distracted        
             2: 3,  # Drinking
-            4: 5,  # SleepyDriving     -> roi cham
+            4: 5,  # SleepyDriving     
             5: 4,  # Yawn
         }
 
