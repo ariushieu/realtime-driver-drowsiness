@@ -123,8 +123,8 @@ class ImprovedDriverDetector:
         # it frame hon de VAO trang thai nguy hiem
         self.STABILITY_ENTER = {       
             0: 2,  # DangerousDriving  
-            1: 6,  # Distracted        
-            2: 4,  # Drinking         
+            1: 3,  # Distracted
+            2: 5,  # Drinking
             3: 3,  # Safe              
             4: 2,  # SleepyDriving     
             5: 3,  # Yawn              
@@ -488,6 +488,7 @@ class ImprovedDriverDetector:
         Dung sensor (EAR + face direction) de override:
         - Mat mo + nhin thang + mieng binh thuong = SAFE bat ke model noi gi.
         - Chi tin model bao Distracted khi nguoi that su QUAY DAU di.
+        - Drinking chi tin khi sensor khong chung minh day la tu the binh thuong.
         """
         if facial_metrics is None:
             return predicted_class, confidence
@@ -495,13 +496,30 @@ class ImprovedDriverDetector:
         ear_drowsy = facial_metrics['is_drowsy']
         mar_yawning = facial_metrics['is_yawning']
         is_facing_forward = facial_metrics.get('is_facing_forward', True)
+        face_ratio = facial_metrics.get('face_ratio', 0.5)
+        sensor_normal = is_facing_forward and not ear_drowsy and not mar_yawning
 
         # ======================================================
-        # RULE 1 (HIGHEST PRIORITY): Mat mo + nhin thang = SAFE
-        # Override model Distracted khi sensor chung minh dang tap trung
+        # RULE 1 (HIGHEST PRIORITY): sensor ro rang hon CNN trong cac
+        # trang thai co hinh hoc khuon mat.
         # ======================================================
-        if predicted_class == 1 and is_facing_forward and not ear_drowsy and not mar_yawning:
-            return 3, confidence  # Ep ve SafeDriving
+        if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD:
+            return 4, max(confidence, 0.90)
+
+        if mar_yawning:
+            return 5, max(confidence, 0.88)
+
+        # Nhin lech/ngoai guong/cua so: ke ca CNN dang bao Safe thi van
+        # phai coi la mat tap trung.
+        if not is_facing_forward:
+            deviation = min(abs(face_ratio - 0.5) / 0.20, 1.0)
+            sensor_conf = 0.72 + 0.18 * deviation
+            return 1, max(confidence, sensor_conf)
+
+        # Mat mo + nhin thang + mieng binh thuong: chan false positive
+        # hay gap cua CNN tren webcam, dac biet Drinking/Distracted.
+        if sensor_normal and predicted_class in (1, 2):
+            return 3, max(confidence, 0.82)  # Ep ve SafeDriving
 
         # ======================================================
         # RULE 2: Boost khi sensor xac nhan model
@@ -526,11 +544,11 @@ class ImprovedDriverDetector:
         # ======================================================
         # EAR thap lien tuc -> buon ngu
         if self.drowsy_frames > self.DROWSY_FRAMES_THRESHOLD // 2 and predicted_class == 3:
-            return 4, confidence
+            return 4, max(confidence, 0.75)
 
         # MAR cao -> ngap
         if mar_yawning and predicted_class == 3:
-            return 5, confidence
+            return 5, max(confidence, 0.75)
 
         return predicted_class, confidence
 
@@ -596,6 +614,7 @@ class ImprovedDriverDetector:
 
         # Giu nguyen class hien tai -> khong can lam gi
         if predicted_class == self.stable_class:
+            self.stable_confidence = confidence
             return self.stable_class, self.stable_confidence
 
         # Dang muon chuyen sang class moi
@@ -1100,20 +1119,20 @@ class ImprovedDriverDetector:
                     break
                 
                 frame = cv2.flip(frame, 1)
+                clean_frame = frame.copy()
                 
                 # Detect faces
                 if self.use_mediapipe:
-                    faces = self.detect_faces_mediapipe(frame)
+                    faces = self.detect_faces_mediapipe(clean_frame)
                 else:
-                    faces = self.detect_faces_haar(frame)
+                    faces = self.detect_faces_haar(clean_frame)
                 
                 # Extract facial landmarks (if enabled)
                 facial_metrics = None
                 if self.use_facemesh and len(faces) > 0:
-                    face_landmarks = self.detect_face_landmarks(frame)
+                    face_landmarks = self.detect_face_landmarks(clean_frame)
                     if face_landmarks:
-                        facial_metrics = self.extract_facial_metrics(frame, face_landmarks)
-                        self.draw_facial_features(frame, facial_metrics)
+                        facial_metrics = self.extract_facial_metrics(clean_frame, face_landmarks)
                 
                 predictions_data = []
                 
@@ -1122,7 +1141,10 @@ class ImprovedDriverDetector:
                     if w < 50 or h < 50:
                         continue
                     
-                    face = frame[y:y+h, x:x+w]
+                    # Model phai nhan anh goc, khong nhan frame da ve
+                    # landmark/UI. Overlay mau cyan lam input lech phan phoi
+                    # train va gay false positive rat manh.
+                    face = clean_frame[y:y+h, x:x+w]
                     
                     # Preprocess and predict
                     face_input = self.preprocess_face(face)
@@ -1134,7 +1156,8 @@ class ImprovedDriverDetector:
 
                     smoothed_predictions = self.smooth_predictions(predictions[0])
 
-                    predicted_class = np.argmax(smoothed_predictions)
+                    raw_class = np.argmax(smoothed_predictions)
+                    predicted_class = raw_class
                     confidence = float(smoothed_predictions[predicted_class])
 
                     # Ket hop EAR/MAR voi model de giam false positive
@@ -1146,8 +1169,17 @@ class ImprovedDriverDetector:
                     predicted_class, confidence = self.stabilize_class(
                         predicted_class, confidence
                     )
-                    
-                    predictions_data.append((predicted_class, confidence, smoothed_predictions))
+
+                    display_probs = smoothed_predictions.copy()
+                    if predicted_class != raw_class:
+                        display_probs[raw_class] = min(display_probs[raw_class],
+                                                       max(0.05, 1.0 - confidence))
+                        display_probs[predicted_class] = max(display_probs[predicted_class],
+                                                             confidence)
+                        display_probs = display_probs / (np.sum(display_probs) + 1e-6)
+                        confidence = float(display_probs[predicted_class])
+
+                    predictions_data.append((predicted_class, confidence, display_probs))
                     
                     # Check for alerts
                     if self.should_alert(predicted_class, facial_metrics):
@@ -1156,6 +1188,9 @@ class ImprovedDriverDetector:
                             print(f"   Eyes closed for {self.drowsy_frames} frames!")
                         self._play_alert_sound(predicted_class)
                 
+                if facial_metrics:
+                    self.draw_facial_features(frame, facial_metrics)
+
                 # Draw UI
                 self.draw_ui(frame, faces, predictions_data, facial_metrics,
                              frame_count)
@@ -1175,12 +1210,19 @@ class ImprovedDriverDetector:
                     self.blink_counter = 0
                     self.yawn_counter = 0
                     self.drowsy_frames = 0
+                    self.was_yawning = False
                     self.stable_class = 3
                     self.stable_confidence = 0.0
                     self.candidate_class = 3
                     self.candidate_count = 0
                     self.prediction_history.clear()
-                    print("🔄 Counters reset")
+                    self.ear_history.clear()
+                    self.mar_history.clear()
+                    self.calibration_ear_buffer = []
+                    self.EAR_BASELINE = None
+                    self.EAR_THRESHOLD = 0.20
+                    self.is_calibrated = False
+                    print("🔄 Counters/calibration reset")
                 
                 frame_count += 1
                 
